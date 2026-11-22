@@ -1,6 +1,6 @@
 # Local configuration
 ESP32/config.h
-windows/config.txt
+host/config.txt
 
 # Python
 __pycache__/
