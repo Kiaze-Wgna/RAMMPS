@@ -1,0 +1,8 @@
+# Local configuration
+ESP32/config.h
+windows/config.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
