@@ -7,6 +7,9 @@
 #include "telegram_ca.h"
 #include <time.h>
 #include <ArduinoJson.h>
+#include <USB.h>
+#include <USBHIDKeyboard.h>
+#include "tusb.h"
 
 struct data{
   String name;
@@ -42,11 +45,14 @@ long nextUpdateOffset = 0;
 bool telegramBootstrapped = false;
 time_t telegramSessionStart = 0;
 bool wakePending = false;
-bool relayActive = false;
-unsigned long relayStarted = 0;
 unsigned long lastWakeAttempt = 0;
-const unsigned long RELAY_DURATION = 250;
 const unsigned long WAKE_COOLDOWN = 30000;
+USBHIDKeyboard Keyboard;
+USBCDC USBSerial;
+volatile bool usbSuspended = false;
+volatile bool remoteWakeAllowed = false;
+bool telemetryMissingShown = false;
+bool wifiStatusShown = false;
 
 // LCD display Rotater
 LiquidCrystal_I2C lcd(0x27,16,2);
@@ -99,6 +105,14 @@ void LCDCycle() {
   }
 }
 
+void displayStatus(const char *line1, const char *line2) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+  lcd.setCursor(0, 1);
+  lcd.print(line2);
+}
+
 bool i2CAddrTest(uint8_t addr) {
   Wire.beginTransmission(addr);
   if (Wire.endTransmission() == 0) {
@@ -109,31 +123,28 @@ bool i2CAddrTest(uint8_t addr) {
 
 void enterMonitorMode() {
   wakePending = false;
-  digitalWrite(RELAY, LOW);
-  relayActive = false;
   telegramConnected = false;
   WiFi.mode(WIFI_OFF);
-  Serial.println("PC Online");
+  USBSerial.println("PC Online");
   awake = true;
   digitalWrite(STATUSLIGHT, LOW);
+  lastHeartbeat = 0;
+  telemetryMissingShown = false;
+  currentData = 0;
 }
 
 void enterRemoteMode() {
+  wifiStatusShown = false;
   wakePending = false;
-  digitalWrite(RELAY, LOW);
-  relayActive = false;
   nextUpdateOffset = 0;
   telegramBootstrapped = false;
   telegramConnected = false;
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.println("PC Offline");
+  USBSerial.println("PC Offline");
   awake = false;
   digitalWrite(STATUSLIGHT, HIGH);
-  lcd.setCursor(0,0);
-  lcd.print("The monitored PC");
-  lcd.setCursor(0,1);
-  lcd.print("   is offline   ");
+  displayStatus(" PC is Sleeping ", "WiFi Connecting.");
 }
 
 bool initializeTelegram() {
@@ -149,11 +160,11 @@ bool initializeTelegram() {
   }
 
   if (time(nullptr) < 1700000000) {
-    Serial.println("NTP synchronization failed");
+    USBSerial.println("NTP synchronization failed");
     return false;
   }
 
-  Serial.println("Telegram initialized");
+  USBSerial.println("Telegram initialized");
   telegramSessionStart = time(nullptr);
   return true;
 }
@@ -178,7 +189,7 @@ bool getTelegramUpdates(String &response, long offset) {
             + "&offset=" + String(offset);
 
   if (!http.begin(client, url)) {
-    Serial.println("HTTP initialization failed");
+    USBSerial.println("HTTP initialization failed");
     return false;
   }
 
@@ -187,7 +198,7 @@ bool getTelegramUpdates(String &response, long offset) {
   if (status == 200) {
     response = http.getString();
   } else {
-    Serial.printf("Telegram HTTP error %d: %s\n", status, http.errorToString(status).c_str());
+    USBSerial.printf("Telegram HTTP error %d: %s\n", status, http.errorToString(status).c_str());
     response = "";
   }
 
@@ -201,12 +212,12 @@ bool processTelegramUpdates(const String &response, bool discard) {
 
   DeserializationError error = deserializeJson(doc, response);
   if (error) {
-      Serial.printf("JSON error: %s\n", error.c_str());
+      USBSerial.printf("JSON error: %s\n", error.c_str());
       return false;
   }
 
   if (doc["ok"] != true || !doc["result"].is<JsonArray>()) {
-      Serial.println("Invalid Telegram response");
+      USBSerial.println("Invalid Telegram response");
       return false;
   }
 
@@ -244,25 +255,53 @@ bool processTelegramUpdates(const String &response, bool discard) {
       now - sentAt <= 30;
 
     if (!authorized) {
-      Serial.println("Unauthorized Telegram message");
+      USBSerial.println("Unauthorized Telegram message");
+      displayStatus("  Unauthorized  ", "message ignored.");
       continue;
     }
 
     if (!fresh) {
-      Serial.println("Ignored stale Telegram message");
+      USBSerial.println("Ignored stale Telegram message");
+      displayStatus(" Stale Telegram ", "message ignored.");
       continue;
     }
 
     if (strcmp(text, "/wake") == 0) {
-      Serial.println("AUTHORIZED WAKE COMMAND RECEIVED!");
+      USBSerial.println("AUTHORIZED WAKE COMMAND RECEIVED!");
 
       wakePending = true;
+      displayStatus(" /wake Received ", " Booting System ");
     } else {
-      Serial.printf("Unknown command: %s\n", text);
+      USBSerial.printf("Unknown command: %s\n", text);
+      displayStatus("Unknown Telegram", "message ignored.");
     }
   }
 
   return true;
+}
+
+void usbEventCallback(void *arg,
+                      esp_event_base_t event_base,
+                      int32_t event_id,
+                      void *event_data) {
+
+  if (event_base != ARDUINO_USB_EVENTS) return;
+
+  switch (event_id) {
+    case ARDUINO_USB_SUSPEND_EVENT: {
+      auto *data = (arduino_usb_event_data_t *)event_data;
+
+      remoteWakeAllowed = data->suspend.remote_wakeup_en;
+      usbSuspended = true;
+      break;
+    }
+
+    case ARDUINO_USB_RESUME_EVENT:
+    case ARDUINO_USB_STOPPED_EVENT:
+      usbSuspended = false;
+      remoteWakeAllowed = false;
+      break;
+  }
 }
 
 void setup() {
@@ -270,21 +309,27 @@ void setup() {
   if (!i2CAddrTest(0x27)) {
     lcd = LiquidCrystal_I2C(0x3F, 16, 2);
   }
-  digitalWrite(RELAY, LOW);
   lcd.init();
   lcd.backlight();
   pinMode(WORKLIGHT, OUTPUT);
   pinMode(STATUSLIGHT, OUTPUT);
-  pinMode(RELAY, OUTPUT);
-  Serial.begin(115200);
-  Serial.println("Initialization Complate");
-  enterRemoteMode();
+  USB.onEvent(usbEventCallback);
+  USB.usbAttributes(TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP);
+  Keyboard.begin();
+  USBSerial.begin(115200);
+  USB.begin();
+  USBSerial.println("Initialization Complate");
 }
 
 void loop() {
+  if (usbSuspended && awake) {
+    enterRemoteMode();
+  } else if (!usbSuspended && tud_mounted() && !awake) {
+    enterMonitorMode();
+  }
   // always try to read from stdin
-  while (Serial.available()) {
-    char inC = Serial.read();
+  while (USBSerial.available()) {
+    char inC = USBSerial.read();
     if (inC == '\n') {
       command = inS;
       commandReady = true;
@@ -301,17 +346,20 @@ void loop() {
       "TELEMETRY %d %d %d %d %d %d",
       &(telemetry[0].value), &(telemetry[1].value), &(telemetry[2].value), &(telemetry[3].value), &(telemetry[4].value), &(telemetry[5].value)
     );
-    Serial.printf("Parsed %d values from: %s\n", count, command.c_str());
+    USBSerial.printf("Parsed %d values from: %s\n", count, command.c_str());
     if (count == 6) {
       digitalWrite(WORKLIGHT, HIGH);
-      Serial.print("Heartbeat arrived in ");
-      Serial.print(millis() - lastHeartbeat);
-      Serial.println("ms");
+      USBSerial.print("Heartbeat arrived in ");
+      USBSerial.print(millis() - lastHeartbeat);
+      USBSerial.println("ms");
       lastFlash = millis();
       lastHeartbeat = millis();
-      if (!awake) {
-        enterMonitorMode();
+      if (telemetryMissingShown) {
+        lcd.clear();
+        currentData = 0;
+        lastCycle = millis() - CYCLE_DURATION;
       }
+      telemetryMissingShown = false;
     }
     commandReady = false;
   }
@@ -319,34 +367,48 @@ void loop() {
     digitalWrite(WORKLIGHT, LOW);
   }
   if (awake) {
-    if (relayActive) {
-      digitalWrite(RELAY, LOW);
-      relayActive = false;
-      lastWakeAttempt = millis();
-    }
     // PC awake: update LCD Board and check for heartbeat
-    if (millis() - lastCycle >= CYCLE_DURATION) {
+    if (millis() - lastHeartbeat >= HEARTBEAT_TIMEOUT) {
+      if (!telemetryMissingShown) {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("  No telemetry  ");
+        lcd.setCursor(0, 1);
+        lcd.print(" data received. ");
+        telemetryMissingShown = true;
+      }
+    } else if (millis() - lastCycle >= CYCLE_DURATION) {
       LCDCycle();
     }
-    if ((millis() - lastHeartbeat) >= HEARTBEAT_TIMEOUT) {
-      enterRemoteMode();
-    }
   } else {
-    if (relayActive && (millis() - relayStarted >= RELAY_DURATION)) {
-      digitalWrite(RELAY, LOW);
-      relayActive = false;
-      lastWakeAttempt = millis();
+    if (wakePending) {
       wakePending = false;
+
+      if (usbSuspended && tud_suspended() && remoteWakeAllowed) {
+        if (lastWakeAttempt != 0 && millis() - lastWakeAttempt < WAKE_COOLDOWN) {
+          displayStatus("  /wake Failed  ", "Cooldown active.");
+          return;
+        }
+
+        if (tud_remote_wakeup()) {
+          lastWakeAttempt = millis();
+          Serial.println("USB remote wakeup requested");
+          displayStatus(" RAMMP Systems: ", " Device Booting ");
+        } else {
+          Serial.println("USB wake request failed");
+          displayStatus("  /wake failed  ", " Request error. ");
+        }
+      } else {
+        Serial.println("USB wake unavailable");
+        displayStatus("  Wake command  ", " is unavailable ");
+      }
       return;
     }
-    if (wakePending && (millis() - lastWakeAttempt >= WAKE_COOLDOWN)) {
-      digitalWrite(RELAY, HIGH);
-      relayActive = true;
-      relayStarted = millis();
-      wakePending = false;
-      return;
-    }
-    if (!relayActive && WiFi.status() == WL_CONNECTED) {
+    if (usbSuspended && WiFi.status() == WL_CONNECTED) {
+      if (!wifiStatusShown) {
+        wifiStatusShown = true;
+        displayStatus(" WiFi Connected ", "Booting Telegram");
+      }
       if (telegramConnected) {
         // PC Sleeping: call Telegram API, boot PC when message received, LCD board activation sequence
         if (millis() - lastTelegramUpdate >= TELEGRAM_UPDATE_INTERVAL) {
@@ -357,7 +419,8 @@ void loop() {
             if (processTelegramUpdates(response, !telegramBootstrapped)) {
               if (!telegramBootstrapped) {
                 telegramBootstrapped = true;
-                Serial.println("Old Telegram messages discarded");
+                USBSerial.println("Old Telegram messages discarded");
+                displayStatus(" Telegram Ready ", "   Send /wake   ");
               }
             }
           }
